@@ -624,6 +624,72 @@ def handle_turnstile_verification(sb, account_index: int, result: Dict,
     logger.error("❌ Turnstile 验证失败（已用尽所有重试轮次）")
     return False
 
+# ================== 登录 Turnstile 处理（新增） ==================
+def _wait_login_turnstile_token(sb, timeout=30) -> bool:
+    """等待登录 Turnstile 生成有效 token（基于 hidden input 长度）"""
+    last_len = 0
+    for _ in range(timeout):
+        token_len = sb.execute_script('''
+            var inp = document.querySelector('input[name="cf-turnstile-response"]');
+            return inp ? inp.value.length : 0;
+        ''')
+        if token_len > 20:
+            logger.info(f"登录 Turnstile token 已生成 (长度 {token_len})")
+            return True
+        if token_len != last_len:
+            last_len = token_len
+        time.sleep(1)
+    logger.warning(f"超时未得到 token，最终长度 {last_len}")
+    return False
+
+def handle_login_turnstile(sb, account_index: int, result: Dict) -> bool:
+    """处理登录页面的 Turnstile 验证（点击复选框，等待 token）"""
+    try:
+        # 等待 Turnstile 出现
+        for _ in range(15):
+            if sb.execute_script("return !!document.querySelector('.cf-turnstile');"):
+                break
+            time.sleep(1)
+        else:
+            logger.info("未检测到 Turnstile，跳过")
+            return True
+
+        logger.info("登录页发现 Turnstile，寻找复选框...")
+        # 尝试点击复选框
+        clicked = sb.execute_script('''
+            var cb = document.querySelector('.cf-turnstile input[type="checkbox"]');
+            if(cb){
+                cb.click();
+                return true;
+            }
+            return false;
+        ''')
+        if not clicked:
+            # 尝试点击 label
+            sb.execute_script('''
+                var label = document.querySelector('.cf-turnstile label');
+                if(label) label.click();
+            ''')
+
+        # 如果仍无效，使用 SeleniumBase 的通用点击验证码方法
+        if not clicked:
+            try:
+                sb.uc_gui_click_captcha()
+            except Exception as e:
+                logger.warning(f"uc_gui_click_captcha 失败: {e}")
+
+        logger.info("等待 Turnstile 完成验证...")
+        if _wait_login_turnstile_token(sb, timeout=30):
+            safe_screenshot(sb, screenshot_path(account_index, "login-turnstile-success"), result)
+            return True
+
+        logger.warning("登录 Turnstile 验证超时")
+        safe_screenshot(sb, screenshot_path(account_index, "login-turnstile-failed"), result)
+        return False
+    except Exception as e:
+        logger.warning(f"处理登录 Turnstile 异常: {e}")
+        return False
+
 # ================== 登录流程 ==================
 def handle_initial_page(sb, account_index: int, result: Dict) -> Optional[str]:
     logger.info("访问登录页...")
@@ -674,6 +740,26 @@ def fill_and_submit(sb, email: str, password: str, account_index: int, result: D
     sb.type('#loginformmodel-username', email)
     sb.type('#loginformmodel-password', password)
     safe_screenshot(sb, screenshot_path(account_index, "03-form-filled"), result)
+
+    # ---------- 处理登录 Turnstile ----------
+    max_turnstile_retries = 2
+    turnstile_ok = False
+    for retry in range(max_turnstile_retries):
+        if handle_login_turnstile(sb, account_index, result):
+            turnstile_ok = True
+            break
+        logger.warning(f"登录 Turnstile 失败（第 {retry+1}/{max_turnstile_retries} 次）")
+        if retry < max_turnstile_retries - 1:
+            logger.info("刷新页面重试 Turnstile …")
+            sb.refresh()
+            time.sleep(4)
+            # 重新填写表单
+            sb.type('#loginformmodel-username', email)
+            sb.type('#loginformmodel-password', password)
+            safe_screenshot(sb, screenshot_path(account_index, "03-form-refilled"), result)
+        else:
+            logger.error("登录 Turnstile 连续失败，放弃本次登录")
+            return False
 
     logger.info("提交登录...")
     try:
